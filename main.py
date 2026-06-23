@@ -142,14 +142,7 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
             proto = pvar.split("://")[0]
             for imp in IMPERSONATE_OPTIONS:
                 try:
-                    checkout_body: dict = {
-                        "entry_point": "all_plans_pricing_modal",
-                        "plan_name": plan,
-                        "billing_details": {
-                            "country": billing_country,
-                        },
-                        "checkout_ui_mode": "custom",
-                    }
+                    checkout_body: dict = {"plan_type": plan}
                     if promo_code:
                         checkout_body["promo_campaign"] = {
                             "promo_campaign_id": promo_code,

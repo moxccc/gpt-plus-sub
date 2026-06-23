@@ -250,7 +250,7 @@ window.__lastPollStatus = null;
             logged_pi_keys = False
             logged_full_resp = False
 
-            # Intercept Stripe poll responses to detect state changes and find redirect
+            # Intercept ALL Stripe responses to find redirect URL
             async def on_response(resp):
                 nonlocal paypal_url, logged_pi_keys, logged_full_resp
                 if paypal_url:
@@ -258,16 +258,15 @@ window.__lastPollStatus = null;
                 url = resp.url
                 if "stripe.com" not in url:
                     return
-                # Match any Stripe poll/API response
-                if "/v1/payment_pages/" not in url and "/v1/payment_intents/" not in url:
-                    return
                 try:
-                    body_text = await resp.text()
-                    if not body_text.startswith('{'):
+                    ct = resp.headers.get("content-type", "")
+                    if "image" in ct or "font" in ct or "woff" in ct:
                         return
-                    data = json.loads(body_text)
+                    body_text = await resp.text()
+                    if len(body_text) < 10:
+                        return
 
-                    # Scan entire response for PayPal/redirect URLs
+                    # First: scan raw text for PayPal/redirect URLs (works on ANY response)
                     if "pm-redirects.stripe.com" in body_text or "ba_token" in body_text:
                         ba_m = re.search(r'ba_token[=:]\s*["\']?(BA-[A-Za-z0-9]+)', body_text)
                         if ba_m:
@@ -280,7 +279,20 @@ window.__lastPollStatus = null;
                             log_fn(f"  找到 Stripe redirect URL")
                             return
 
-                    # Track poll status
+                    # Also check for paypal.com URLs
+                    if "paypal.com" in body_text:
+                        pp_m = re.search(r'(https://www\.paypal\.com/[^"\'\\<>\s]+ba_token=[^"\'\\<>\s&]+)', body_text)
+                        if pp_m:
+                            paypal_url = pp_m.group(1)
+                            log_fn(f"  找到 PayPal URL in response")
+                            return
+
+                    # Try to parse as JSON for structured data
+                    if not body_text.lstrip().startswith('{'):
+                        return
+                    data = json.loads(body_text)
+
+                    # Track poll status (payment_pages responses)
                     po_status = data.get("payment_object_status")
                     if po_status:
                         if not stripe_confirmed.is_set():
@@ -288,70 +300,69 @@ window.__lastPollStatus = null;
                         if po_status in ("requires_action", "requires_confirmation", "processing"):
                             stripe_confirmed.set()
 
-                    # One-time: dump top-level keys when requires_action first seen
+                    # One-time: dump response keys
                     if po_status == "requires_action" and not logged_full_resp:
                         logged_full_resp = True
-                        top_keys = list(data.keys())
-                        log_fn(f"  [DEBUG] 响应顶层 keys: {top_keys}")
+                        log_fn(f"  [DEBUG] keys: {list(data.keys())}")
                         pi_val = data.get("payment_intent")
-                        if pi_val is None:
-                            log_fn(f"  [DEBUG] payment_intent = None")
-                        elif isinstance(pi_val, str):
-                            log_fn(f"  [DEBUG] payment_intent = str: {pi_val[:40]}")
-                        elif isinstance(pi_val, dict):
-                            log_fn(f"  [DEBUG] payment_intent keys: {list(pi_val.keys())}")
-                            log_fn(f"  [DEBUG] PI status: {pi_val.get('status')}")
-                            log_fn(f"  [DEBUG] PI next_action: {pi_val.get('next_action')}")
-                        # Also dump any field containing 'url' or 'redirect'
-                        for k, v in data.items():
-                            if isinstance(v, str) and ('http' in v or 'url' in k.lower()):
-                                log_fn(f"  [DEBUG] {k}: {v[:150]}")
+                        log_fn(f"  [DEBUG] payment_intent type: {type(pi_val).__name__}")
 
-                    # Deep search for payment_intent and next_action
+                    # Deep search for payment_intent.next_action
                     pi = data.get("payment_intent")
-                    if pi:
-                        if isinstance(pi, str) and not logged_pi_keys:
-                            log_fn(f"  payment_intent 是字符串 ID: {pi[:30]}...")
-                            logged_pi_keys = True
-                        elif isinstance(pi, dict):
-                            if not logged_pi_keys:
-                                log_fn(f"  payment_intent keys: {list(pi.keys())[:15]}")
-                                na = pi.get("next_action")
-                                if na:
-                                    log_fn(f"  next_action: {json.dumps(na)[:200]}")
-                                logged_pi_keys = True
-                            na = pi.get("next_action")
-                            if na and isinstance(na, dict):
-                                # Check redirect_to_url
-                                redir = na.get("redirect_to_url")
-                                if isinstance(redir, dict):
-                                    stripe_url = redir.get("url", "")
-                                    if stripe_url:
-                                        log_fn(f"  找到 redirect_to_url!")
-                                        paypal_url = stripe_url
-                                        return
-                                # Check any URL in next_action
-                                na_str = json.dumps(na)
-                                url_m = re.search(r'(https://[^"\\]+)', na_str)
-                                if url_m:
-                                    paypal_url = url_m.group(1)
-                                    log_fn(f"  找到 next_action URL: {paypal_url[:80]}")
+                    if pi and isinstance(pi, dict):
+                        na = pi.get("next_action")
+                        if na and isinstance(na, dict):
+                            log_fn(f"  [DEBUG] Found next_action: {json.dumps(na)[:200]}")
+                            redir = na.get("redirect_to_url")
+                            if isinstance(redir, dict):
+                                stripe_url = redir.get("url", "")
+                                if stripe_url:
+                                    paypal_url = stripe_url
+                                    log_fn(f"  找到 redirect_to_url!")
                                     return
+                            na_str = json.dumps(na)
+                            url_m = re.search(r'(https://[^"\\]+)', na_str)
+                            if url_m:
+                                paypal_url = url_m.group(1)
+                                log_fn(f"  找到 next_action URL")
+                                return
 
-                    # Also check top-level next_action
-                    top_na = data.get("next_action")
-                    if top_na and isinstance(top_na, dict):
-                        na_str = json.dumps(top_na)
-                        url_m = re.search(r'(https://[^"\\]+)', na_str)
-                        if url_m:
-                            paypal_url = url_m.group(1)
-                            log_fn(f"  找到顶层 next_action URL")
-                            return
+                    # Check if this IS a payment_intent response (direct PI fetch)
+                    if data.get("object") == "payment_intent":
+                        na = data.get("next_action")
+                        if na and isinstance(na, dict):
+                            log_fn(f"  [DEBUG] Direct PI next_action: {json.dumps(na)[:200]}")
+                            redir = na.get("redirect_to_url")
+                            if isinstance(redir, dict):
+                                stripe_url = redir.get("url", "")
+                                if stripe_url:
+                                    paypal_url = stripe_url
+                                    return
+                            na_str = json.dumps(na)
+                            url_m = re.search(r'(https://[^"\\]+)', na_str)
+                            if url_m:
+                                paypal_url = url_m.group(1)
+                                return
 
                 except Exception:
                     pass
 
+            # Capture popup windows (Stripe.js opens PayPal in popup)
+            async def on_popup(popup):
+                nonlocal paypal_url
+                popup_url = popup.url
+                log_fn(f"  [POPUP] {popup_url[:120]}")
+                if "paypal.com" in popup_url:
+                    ba_m = re.search(r'ba_token=(BA-[A-Za-z0-9]+)', popup_url)
+                    if ba_m:
+                        paypal_url = f"https://www.paypal.com/agreements/approve?ba_token={ba_m.group(1)}"
+                    else:
+                        paypal_url = popup_url
+                elif "pm-redirects.stripe.com" in popup_url:
+                    paypal_url = popup_url
+
             page.on("response", on_response)
+            page.on("popup", on_popup)
             await page.goto(f"http://127.0.0.1:{port}/checkout.html", timeout=60000)
 
             # Wait for Stripe.js to init and confirm
@@ -407,12 +418,72 @@ window.__lastPollStatus = null;
                 srv.shutdown()
                 return None
 
-            # --- Step 4: Wait for poll to return payment_intent.next_action ---
+            # --- Step 4: Wait for Stripe to return PayPal redirect ---
             log_fn("Step 4: 等待 Stripe 返回 PayPal redirect...")
-            for i in range(60):
+
+            # Wait up to 30s for response interceptor or popup to find URL
+            for i in range(30):
                 await asyncio.sleep(1)
                 if paypal_url:
                     break
+
+            # Fallback: check if confirm() resolved with a redirect URL
+            if not paypal_url:
+                log_fn("  尝试从 Stripe.js confirm 结果获取...")
+                confirm_result = await page.evaluate("window.__confirmResult || null")
+                confirm_err = await page.evaluate("window.__confirmError || null")
+                if confirm_result:
+                    log_fn(f"  [DEBUG] confirmResult: {str(confirm_result)[:200]}")
+                    m = re.search(r'(https://[^"\'\\<>\s]*(?:ba_token|pm-redirects|paypal)[^"\'\\<>\s]*)', str(confirm_result))
+                    if m:
+                        paypal_url = m.group(1)
+                if confirm_err:
+                    log_fn(f"  [DEBUG] confirmError: {confirm_err}")
+
+            # Fallback: check current page URL (Stripe.js might have redirected)
+            if not paypal_url:
+                current_url = page.url
+                if "paypal.com" in current_url or "pm-redirects" in current_url:
+                    log_fn(f"  页面已跳转到: {current_url[:100]}")
+                    paypal_url = current_url
+
+            # Fallback: use JavaScript to directly retrieve PI from Stripe
+            if not paypal_url:
+                log_fn("  尝试直接通过 Stripe API 获取 PaymentIntent...")
+                pi_data = await page.evaluate(f"""
+                    (async () => {{
+                        try {{
+                            // Try to get PI via fetch to Stripe API
+                            const resp = await fetch(
+                                'https://api.stripe.com/v1/payment_pages/{cs_id}/confirm',
+                                {{
+                                    method: 'POST',
+                                    headers: {{
+                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                        'Authorization': 'Bearer ' + '{pk}'
+                                    }},
+                                    body: 'client_secret={client_secret}'
+                                }}
+                            );
+                            const text = await resp.text();
+                            return text.substring(0, 2000);
+                        }} catch(e) {{
+                            return 'fetch_error: ' + e.message;
+                        }}
+                    }})()
+                """)
+                if pi_data and "pm-redirects" in str(pi_data):
+                    m = re.search(r'(https://pm-redirects\.stripe\.com[^"\'\\<>\s]+)', str(pi_data))
+                    if m:
+                        paypal_url = m.group(1)
+                        log_fn(f"  从 Stripe API 获取到 redirect URL")
+                elif pi_data and "ba_token" in str(pi_data):
+                    m = re.search(r'ba_token[=:]\s*["\']?(BA-[A-Za-z0-9]+)', str(pi_data))
+                    if m:
+                        paypal_url = f"https://www.paypal.com/agreements/approve?ba_token={m.group(1)}"
+                        log_fn(f"  从 Stripe API 获取到 ba_token")
+                else:
+                    log_fn(f"  [DEBUG] Stripe API resp: {str(pi_data)[:300]}")
 
             await browser.close()
     finally:

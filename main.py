@@ -42,6 +42,7 @@ class SubmitRequest(BaseModel):
     retry_count: int = 3
     billing_country: str = "US"
     language: str = "en-US"
+    promo_code: str = ""
 
 
 def parse_proxy(proxy_str: str) -> str:
@@ -119,7 +120,8 @@ def _extract_paypal_url(text: str) -> Optional[str]:
 
 
 async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
-                          log_fn=None) -> Optional[str]:
+                          log_fn=None, promo_code: str = "",
+                          billing_country: str = "US") -> Optional[str]:
     if log_fn is None:
         log_fn = lambda msg: print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -127,7 +129,10 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
     headers = build_headers(token, device_id)
 
     # --- Step 1: Create checkout session ---
-    log_fn("Step 1: 创建 checkout session...")
+    if promo_code:
+        log_fn(f"Step 1: 创建 checkout session (优惠码: {promo_code})...")
+    else:
+        log_fn("Step 1: 创建 checkout session...")
     co = None
     working_imp = None
     working_proxy = None
@@ -137,10 +142,23 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
             proto = pvar.split("://")[0]
             for imp in IMPERSONATE_OPTIONS:
                 try:
+                    checkout_body: dict = {
+                        "entry_point": "all_plans_pricing_modal",
+                        "plan_name": plan,
+                        "billing_details": {
+                            "country": billing_country,
+                        },
+                        "checkout_ui_mode": "custom",
+                    }
+                    if promo_code:
+                        checkout_body["promo_campaign"] = {
+                            "promo_campaign_id": promo_code,
+                            "is_coupon_from_query_param": False,
+                        }
                     r = await sess.post(
                         f"{CHATGPT_BASE}/backend-api/payments/checkout",
                         headers=headers,
-                        json={"plan_type": plan},
+                        json=checkout_body,
                         proxy=pvar,
                         impersonate=imp,
                         timeout=30,
@@ -447,7 +465,8 @@ async def run_task(task_id: str, req: SubmitRequest):
     proxy = parse_proxy(req.proxy)
     token = extract_token(req.token)
 
-    log(f"任务开始 (计划: {req.plan}, 国家: {req.billing_country})")
+    promo_msg = f", 优惠码: {req.promo_code}" if req.promo_code else ""
+    log(f"任务开始 (计划: {req.plan}, 国家: {req.billing_country}{promo_msg})")
 
     last_error = None
     for attempt in range(1, req.retry_count + 1):
@@ -460,7 +479,11 @@ async def run_task(task_id: str, req: SubmitRequest):
             log(f"=== 第 {attempt}/{req.retry_count} 次尝试 ===")
 
         try:
-            result = await get_paypal_link(token, proxy, req.plan, log)
+            result = await get_paypal_link(
+                token, proxy, req.plan, log,
+                promo_code=req.promo_code,
+                billing_country=req.billing_country,
+            )
             if result:
                 log(f"成功! PayPal URL: {result}")
                 ba = re.search(r'ba_token=(BA-[A-Za-z0-9]+)', result)

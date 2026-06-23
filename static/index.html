@@ -225,15 +225,17 @@
 
   <div class="row">
     <div class="col">
-      <label>失败重试次数</label>
-      <input type="number" id="retry" value="3" min="1" max="20">
+      <label>订阅计划</label>
+      <select id="plan">
+        <option value="chatgptplusplan" selected>ChatGPT Plus ($20/月)</option>
+        <option value="chatgptplusplan_free">✨ ChatGPT Plus 免费试用 (1个月)</option>
+        <option value="chatgptteamplan">ChatGPT Team</option>
+        <option value="chatgptproplan">ChatGPT Pro ($200/月)</option>
+      </select>
     </div>
     <div class="col">
-      <label>账单国家</label>
-      <select id="country">
-        <option value="US" selected>美国 (US) - PayPal</option>
-        <option value="JP">日本 (JP)</option>
-      </select>
+      <label>失败重试次数</label>
+      <input type="number" id="retry" value="3" min="1" max="20">
     </div>
   </div>
 
@@ -241,11 +243,10 @@
     <summary>&#9654; 高级参数</summary>
     <div class="row">
       <div class="col">
-        <label>订阅计划</label>
-        <select id="plan">
-          <option value="chatgptplusplan" selected>ChatGPT Plus ($20/月)</option>
-          <option value="chatgptteamplan">ChatGPT Team</option>
-          <option value="chatgptproplan">ChatGPT Pro ($200/月)</option>
+        <label>账单国家</label>
+        <select id="country">
+          <option value="US" selected>美国 (US) - PayPal</option>
+          <option value="JP">日本 (JP)</option>
         </select>
       </div>
       <div class="col">
@@ -331,12 +332,19 @@ async function submit() {
   $('log').textContent = '';
   setStatus('running', '运行中...');
 
+  let planVal = $('plan').value;
+  let promo = '';
+  if (planVal === 'chatgptplusplan_free') {
+    planVal = 'chatgptplusplan';
+    promo = 'plus-1-month-free';
+  }
   const body = {
     proxy, token,
-    plan: $('plan').value,
+    plan: planVal,
     retry_count: parseInt($('retry').value) || 3,
     billing_country: $('country').value,
     language: $('lang').value,
+    promo_code: promo,
   };
 
   try {

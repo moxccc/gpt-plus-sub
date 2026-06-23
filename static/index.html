@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPT Plus 订阅工具</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans SC',sans-serif;
+    background:#0d0d1a;
+    color:#c8c8d8;
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:30px 16px 60px;
+  }
+  h1{
+    color:#7c6cf0;
+    font-size:1.8rem;
+    font-weight:700;
+    margin-bottom:28px;
+    letter-spacing:1px;
+  }
+  .card{
+    background:#16162a;
+    border:1px solid #2a2a44;
+    border-radius:12px;
+    padding:24px;
+    width:100%;
+    max-width:640px;
+    margin-bottom:20px;
+  }
+  label{
+    display:block;
+    font-size:.85rem;
+    color:#9090b0;
+    margin-bottom:6px;
+    font-weight:500;
+  }
+  input[type=text],input[type=number],textarea,select{
+    width:100%;
+    background:#1e1e38;
+    border:1px solid #2e2e50;
+    border-radius:8px;
+    color:#e0e0f0;
+    padding:10px 14px;
+    font-size:.9rem;
+    outline:none;
+    transition:border-color .2s;
+    font-family:inherit;
+  }
+  input:focus,textarea:focus,select:focus{
+    border-color:#7c6cf0;
+  }
+  textarea{
+    resize:vertical;
+    min-height:80px;
+    line-height:1.5;
+  }
+  .hint{
+    font-size:.75rem;
+    color:#6868a0;
+    margin-top:4px;
+  }
+  .row{
+    display:flex;
+    gap:16px;
+    margin-bottom:16px;
+  }
+  .row>.col{flex:1}
+  .mb16{margin-bottom:16px}
+  .btn-group{display:flex;gap:8px;margin-top:8px;margin-bottom:16px}
+  .btn{
+    padding:8px 18px;
+    border:none;
+    border-radius:8px;
+    cursor:pointer;
+    font-size:.85rem;
+    font-weight:600;
+    transition:opacity .2s,transform .1s;
+  }
+  .btn:hover{opacity:.85}
+  .btn:active{transform:scale(.97)}
+  .btn-primary{background:#7c6cf0;color:#fff}
+  .btn-secondary{background:#2a2a50;color:#b0b0d0}
+  .btn-danger{background:#e04040;color:#fff}
+  .btn-submit{
+    background:linear-gradient(135deg,#7c6cf0,#5a4cd0);
+    color:#fff;
+    font-size:1rem;
+    padding:12px 0;
+    width:100%;
+    max-width:200px;
+    border-radius:10px;
+    margin-top:4px;
+  }
+  .btn-submit:disabled{opacity:.5;cursor:not-allowed}
+  .btn-stop{
+    background:#e04040;
+    color:#fff;
+    font-size:.9rem;
+    padding:10px 24px;
+    border-radius:10px;
+    margin-top:4px;
+    display:none;
+  }
+  details{margin-top:4px}
+  details summary{
+    color:#7c6cf0;
+    cursor:pointer;
+    font-size:.85rem;
+    font-weight:500;
+    user-select:none;
+  }
+  details[open] summary{margin-bottom:12px}
+  .status-bar{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-bottom:12px;
+    font-size:.9rem;
+  }
+  .dot{
+    width:10px;height:10px;border-radius:50%;
+    display:inline-block;
+    flex-shrink:0;
+  }
+  .dot-idle{background:#606090}
+  .dot-running{background:#f0c040;animation:pulse 1s infinite}
+  .dot-success{background:#40d070}
+  .dot-failed{background:#e04040}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .log-area{
+    background:#0a0a16;
+    border:1px solid #1e1e38;
+    border-radius:8px;
+    padding:14px;
+    font-family:'JetBrains Mono','Fira Code','Consolas',monospace;
+    font-size:.8rem;
+    line-height:1.6;
+    min-height:180px;
+    max-height:400px;
+    overflow-y:auto;
+    white-space:pre-wrap;
+    word-break:break-all;
+    color:#80d080;
+  }
+  .result-box{
+    display:none;
+    background:linear-gradient(135deg,#1a6040,#145030);
+    border:1px solid #20a060;
+    border-radius:10px;
+    padding:16px 20px;
+    margin-top:14px;
+    word-break:break-all;
+  }
+  .result-box a{
+    color:#60f0a0;
+    text-decoration:underline;
+    font-weight:600;
+    font-size:.95rem;
+  }
+  .result-label{
+    font-size:.8rem;
+    color:#a0d0b0;
+    margin-bottom:4px;
+    font-weight:600;
+  }
+  .copy-btn{
+    margin-left:10px;
+    background:#20a060;
+    color:#fff;
+    border:none;
+    border-radius:6px;
+    padding:4px 12px;
+    font-size:.75rem;
+    cursor:pointer;
+  }
+  .copy-btn:hover{background:#30c070}
+  .history-list{margin-top:12px}
+  .history-item{
+    background:#1a1a30;
+    border:1px solid #2a2a44;
+    border-radius:8px;
+    padding:10px 14px;
+    margin-bottom:8px;
+    font-size:.8rem;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+  }
+  .history-item a{color:#7c6cf0;text-decoration:none}
+  .history-item a:hover{text-decoration:underline}
+  .history-time{color:#6868a0;font-size:.7rem}
+  .footer{
+    margin-top:30px;
+    text-align:center;
+    font-size:.7rem;
+    color:#404060;
+  }
+</style>
+</head>
+<body>
+
+<h1>GPT Plus 订阅工具</h1>
+
+<!-- Main Form Card -->
+<div class="card">
+  <div class="mb16">
+    <label>代理 (格式: user:pass@host:port)</label>
+    <input type="text" id="proxy" placeholder="user:pass@host:port">
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary" onclick="saveProxy()">保存代理</button>
+    <button class="btn btn-secondary" onclick="clearProxy()">清除</button>
+  </div>
+
+  <div class="mb16">
+    <label>Token / 账号 JSON</label>
+    <textarea id="token" rows="4" placeholder="粘贴 accessToken (ey开头的JWT) 或完整的 session JSON&#10;&#10;获取方式: 浏览器登录 chatgpt.com 后访问&#10;https://chatgpt.com/api/auth/session&#10;复制其中的 accessToken 字段"></textarea>
+    <div class="hint">从 chatgpt.com/api/auth/session 获取 accessToken</div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label>失败重试次数</label>
+      <input type="number" id="retry" value="3" min="1" max="20">
+    </div>
+    <div class="col">
+      <label>账单国家</label>
+      <select id="country">
+        <option value="US" selected>美国 (US) - PayPal</option>
+        <option value="JP">日本 (JP)</option>
+      </select>
+    </div>
+  </div>
+
+  <details>
+    <summary>&#9654; 高级参数</summary>
+    <div class="row">
+      <div class="col">
+        <label>订阅计划</label>
+        <select id="plan">
+          <option value="chatgptplusplan" selected>ChatGPT Plus ($20/月)</option>
+          <option value="chatgptteamplan">ChatGPT Team</option>
+          <option value="chatgptproplan">ChatGPT Pro ($200/月)</option>
+        </select>
+      </div>
+      <div class="col">
+        <label>界面语言</label>
+        <select id="lang">
+          <option value="en-US">English</option>
+          <option value="ja-JP">日本語</option>
+          <option value="zh-Hans">中文</option>
+        </select>
+      </div>
+    </div>
+  </details>
+
+  <div style="display:flex;gap:12px;align-items:center;margin-top:8px">
+    <button class="btn btn-submit" id="submitBtn" onclick="submit()">提交任务</button>
+    <button class="btn btn-stop" id="stopBtn" onclick="stopTask()">停止</button>
+  </div>
+</div>
+
+<!-- Status Card -->
+<div class="card">
+  <div class="status-bar">
+    <span class="dot dot-idle" id="dot"></span>
+    <span id="statusText">就绪</span>
+  </div>
+  <div class="log-area" id="log">等待任务提交...</div>
+
+  <div class="result-box" id="resultBox">
+    <div class="result-label">PayPal 支付链接</div>
+    <a id="resultUrl" href="#" target="_blank"></a>
+    <button class="copy-btn" onclick="copyUrl()">复制</button>
+  </div>
+</div>
+
+<!-- History Card -->
+<div class="card" id="historyCard" style="display:none">
+  <label>历史记录</label>
+  <div class="history-list" id="historyList"></div>
+</div>
+
+<div class="footer">GPT Plus Subscription Tool &middot; PayPal ba_token 提取</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// Load saved proxy
+const savedProxy = localStorage.getItem('gpt_proxy');
+if (savedProxy) $('proxy').value = savedProxy;
+
+// Load history
+let history = JSON.parse(localStorage.getItem('gpt_history') || '[]');
+renderHistory();
+
+function saveProxy() {
+  const v = $('proxy').value.trim();
+  if (v) {
+    localStorage.setItem('gpt_proxy', v);
+    flash('代理已保存');
+  }
+}
+function clearProxy() {
+  $('proxy').value = '';
+  localStorage.removeItem('gpt_proxy');
+}
+function flash(msg) {
+  const old = $('statusText').textContent;
+  $('statusText').textContent = msg;
+  setTimeout(() => { if ($('statusText').textContent === msg) $('statusText').textContent = old; }, 1500);
+}
+
+let currentTaskId = null;
+let pollTimer = null;
+
+async function submit() {
+  const proxy = $('proxy').value.trim();
+  const token = $('token').value.trim();
+  if (!proxy) { flash('请输入代理'); return; }
+  if (!token) { flash('请输入 Token'); return; }
+
+  $('submitBtn').disabled = true;
+  $('stopBtn').style.display = 'inline-block';
+  $('resultBox').style.display = 'none';
+  $('log').textContent = '';
+  setStatus('running', '运行中...');
+
+  const body = {
+    proxy, token,
+    plan: $('plan').value,
+    retry_count: parseInt($('retry').value) || 3,
+    billing_country: $('country').value,
+    language: $('lang').value,
+  };
+
+  try {
+    const r = await fetch('/api/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    currentTaskId = data.task_id;
+    pollStatus();
+  } catch (e) {
+    setStatus('failed', '提交失败: ' + e.message);
+    $('submitBtn').disabled = false;
+    $('stopBtn').style.display = 'none';
+  }
+}
+
+function pollStatus() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    if (!currentTaskId) return;
+    try {
+      const r = await fetch('/api/status/' + currentTaskId);
+      const s = await r.json();
+      $('log').textContent = s.logs.join('\n');
+      $('log').scrollTop = $('log').scrollHeight;
+
+      if (s.paypal_url) {
+        $('resultBox').style.display = 'block';
+        $('resultUrl').href = s.paypal_url;
+        $('resultUrl').textContent = s.paypal_url;
+      }
+
+      if (s.status === 'success') {
+        setStatus('success', '成功');
+        done(s.paypal_url);
+      } else if (s.status === 'failed') {
+        setStatus('failed', '失败: ' + (s.error || '未知错误'));
+        done(null);
+      } else if (s.status === 'cancelled') {
+        setStatus('failed', '已取消');
+        done(null);
+      }
+    } catch (e) {}
+  }, 1000);
+}
+
+function done(url) {
+  clearInterval(pollTimer);
+  $('submitBtn').disabled = false;
+  $('stopBtn').style.display = 'none';
+  if (url) {
+    addHistory(url);
+  }
+}
+
+async function stopTask() {
+  if (!currentTaskId) return;
+  try { await fetch('/api/stop/' + currentTaskId, { method: 'POST' }); } catch(e) {}
+  flash('正在停止...');
+}
+
+function setStatus(type, text) {
+  const dot = $('dot');
+  dot.className = 'dot dot-' + (type === 'running' ? 'running' : type === 'success' ? 'success' : type === 'failed' ? 'failed' : 'idle');
+  $('statusText').textContent = text;
+}
+
+function copyUrl() {
+  const url = $('resultUrl').textContent;
+  navigator.clipboard.writeText(url).then(() => flash('已复制'));
+}
+
+function addHistory(url) {
+  const item = { url, time: new Date().toLocaleString('zh-CN') };
+  history.unshift(item);
+  if (history.length > 20) history = history.slice(0, 20);
+  localStorage.setItem('gpt_history', JSON.stringify(history));
+  renderHistory();
+}
+
+function renderHistory() {
+  const el = $('historyList');
+  if (!history.length) { $('historyCard').style.display = 'none'; return; }
+  $('historyCard').style.display = 'block';
+  el.innerHTML = history.map(h =>
+    `<div class="history-item">
+      <a href="${h.url}" target="_blank">${h.url}</a>
+      <span class="history-time">${h.time}</span>
+    </div>`
+  ).join('');
+}
+</script>
+</body>
+</html>

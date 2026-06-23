@@ -6,7 +6,7 @@ GPT Plus Subscription Tool
 1. 通过代理 + Token 调用 OpenAI API 创建 Stripe Checkout Session (US billing → PayPal可用)
 2. Playwright + Stripe.js: 设置账单地址 + 创建PayPal PM + confirm
 3. 调用 OpenAI approve 端点批准支付
-4. 从 Stripe poll 获取 payment_intent.next_action.redirect_to_url
+4. Re-init Stripe checkout 获取 payment_intent 中的 redirect URL
 5. 跟踪 Stripe redirect 302 → PayPal ba_token URL
 """
 
@@ -30,7 +30,6 @@ from pydantic import BaseModel
 app = FastAPI(title="GPT Plus Subscription Tool")
 
 CHATGPT_BASE = "https://chatgpt.com"
-# Try multiple TLS fingerprints since proxy compatibility varies
 IMPERSONATE_OPTIONS = ["chrome110", "chrome120", "chrome116", "chrome99", "safari15_3"]
 
 tasks: dict = {}
@@ -50,7 +49,6 @@ def parse_proxy(proxy_str: str) -> str:
     proxy_str = proxy_str.strip()
     if "://" in proxy_str:
         return proxy_str
-    # Default to socks5 (most residential proxies use socks5)
     return f"socks5://{proxy_str}"
 
 
@@ -106,28 +104,29 @@ def _serve_html(html_content: str, port: int):
     return srv
 
 
+def _extract_paypal_url(text: str) -> Optional[str]:
+    """Extract PayPal ba_token URL or Stripe redirect URL from text."""
+    ba_m = re.search(r'ba_token[=:]\s*["\']?(BA-[A-Za-z0-9]+)', text)
+    if ba_m:
+        return f"https://www.paypal.com/agreements/approve?ba_token={ba_m.group(1)}"
+    redir_m = re.search(r'(https://pm-redirects\.stripe\.com[^"\'\\\s<>]+)', text)
+    if redir_m:
+        return redir_m.group(1)
+    pp_m = re.search(r'(https://www\.paypal\.com/[^"\'\\\s<>]+ba_token=[^"\'\\\s<>&]+)', text)
+    if pp_m:
+        return pp_m.group(1)
+    return None
+
+
 async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
                           log_fn=None) -> Optional[str]:
-    """
-    Main function: get PayPal ba_token URL for GPT Plus subscription.
-
-    Args:
-        token: OpenAI access token (JWT)
-        proxy: HTTP proxy URL (e.g. http://user:pass@host:port)
-        plan: Plan name (default: chatgptplusplan)
-        log_fn: Optional logging callback
-
-    Returns:
-        PayPal URL like https://www.paypal.com/agreements/approve?ba_token=BA-xxx
-        or None on failure
-    """
     if log_fn is None:
         log_fn = lambda msg: print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
     device_id = str(uuid.uuid4())
     headers = build_headers(token, device_id)
 
-    # --- Step 1: Create checkout session (US billing → PayPal available) ---
+    # --- Step 1: Create checkout session ---
     log_fn("Step 1: 创建 checkout session...")
     co = None
     working_imp = None
@@ -155,13 +154,13 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
                     log_fn(f"  {proto}+{imp}: HTTP {r.status_code}")
                 except Exception as e:
                     log_fn(f"  {proto}+{imp}: {str(e)[:60]}")
-                    break  # Same proxy protocol fails, try next protocol
+                    break
             if co is not None:
                 break
         if co is None:
             log_fn("创建 checkout 失败: 所有代理协议+TLS 指纹均失败")
             return None
-    proxy = working_proxy  # Use the working proxy for subsequent requests
+    proxy = working_proxy
 
     cs_id = co.get("checkout_session_id", "")
     pk = co.get("publishable_key", "")
@@ -181,16 +180,11 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
 
     from playwright.async_api import async_playwright
 
-    # Build HTML page with Stripe.js
     html = f"""<!DOCTYPE html><html><body>
 <script src="https://js.stripe.com/v3/"></script>
 <script>
 window.__ready = false;
-window.__confirmed = false;
 window.__error = null;
-window.__paypalUrl = null;
-window.__pollCount = 0;
-window.__lastPollStatus = null;
 
 (async function() {{
     try {{
@@ -219,17 +213,10 @@ window.__lastPollStatus = null;
 
         window.__ready = true;
 
-        // Fire confirm (runs async, polls Stripe for result)
         co.confirm({{
             paymentMethod: paymentMethod.id,
             returnUrl: 'https://chatgpt.com/#settings/subscription'
-        }}).then(r => {{
-            window.__confirmed = true;
-            window.__confirmResult = JSON.stringify(r);
-        }}).catch(e => {{
-            window.__confirmed = true;
-            window.__confirmError = e.message;
-        }});
+        }}).catch(() => {{}});
     }} catch(e) {{
         window.__error = 'Init: ' + e.message;
     }}
@@ -247,12 +234,9 @@ window.__lastPollStatus = null;
             page = await browser.new_page()
 
             stripe_confirmed = asyncio.Event()
-            logged_pi_keys = False
-            logged_full_resp = False
 
-            # Intercept ALL Stripe responses to find redirect URL
             async def on_response(resp):
-                nonlocal paypal_url, logged_pi_keys, logged_full_resp
+                nonlocal paypal_url
                 if paypal_url:
                     return
                 url = resp.url
@@ -266,106 +250,52 @@ window.__lastPollStatus = null;
                     if len(body_text) < 10:
                         return
 
-                    # First: scan raw text for PayPal/redirect URLs (works on ANY response)
-                    if "pm-redirects.stripe.com" in body_text or "ba_token" in body_text:
-                        ba_m = re.search(r'ba_token[=:]\s*["\']?(BA-[A-Za-z0-9]+)', body_text)
-                        if ba_m:
-                            paypal_url = f"https://www.paypal.com/agreements/approve?ba_token={ba_m.group(1)}"
-                            log_fn(f"  直接找到 ba_token: {ba_m.group(1)}")
-                            return
-                        redir_m = re.search(r'(https://pm-redirects\.stripe\.com[^"\'\\<>\s]+)', body_text)
-                        if redir_m:
-                            paypal_url = redir_m.group(1)
-                            log_fn(f"  找到 Stripe redirect URL")
-                            return
+                    found = _extract_paypal_url(body_text)
+                    if found:
+                        paypal_url = found
+                        log_fn(f"  找到 redirect URL")
+                        return
 
-                    # Also check for paypal.com URLs
-                    if "paypal.com" in body_text:
-                        pp_m = re.search(r'(https://www\.paypal\.com/[^"\'\\<>\s]+ba_token=[^"\'\\<>\s&]+)', body_text)
-                        if pp_m:
-                            paypal_url = pp_m.group(1)
-                            log_fn(f"  找到 PayPal URL in response")
-                            return
-
-                    # Try to parse as JSON for structured data
                     if not body_text.lstrip().startswith('{'):
                         return
                     data = json.loads(body_text)
 
-                    # Track poll status (payment_pages responses)
                     po_status = data.get("payment_object_status")
-                    if po_status:
-                        if not stripe_confirmed.is_set():
-                            log_fn(f"  Stripe poll: status={po_status}")
-                        if po_status in ("requires_action", "requires_confirmation", "processing"):
-                            stripe_confirmed.set()
+                    if po_status and po_status in ("requires_action", "requires_confirmation", "processing"):
+                        stripe_confirmed.set()
 
-                    # One-time: dump response keys
-                    if po_status == "requires_action" and not logged_full_resp:
-                        logged_full_resp = True
-                        log_fn(f"  [DEBUG] keys: {list(data.keys())}")
-                        pi_val = data.get("payment_intent")
-                        log_fn(f"  [DEBUG] payment_intent type: {type(pi_val).__name__}")
-
-                    # Deep search for payment_intent.next_action
                     pi = data.get("payment_intent")
                     if pi and isinstance(pi, dict):
                         na = pi.get("next_action")
                         if na and isinstance(na, dict):
-                            log_fn(f"  [DEBUG] Found next_action: {json.dumps(na)[:200]}")
-                            redir = na.get("redirect_to_url")
-                            if isinstance(redir, dict):
-                                stripe_url = redir.get("url", "")
-                                if stripe_url:
-                                    paypal_url = stripe_url
-                                    log_fn(f"  找到 redirect_to_url!")
-                                    return
                             na_str = json.dumps(na)
-                            url_m = re.search(r'(https://[^"\\]+)', na_str)
-                            if url_m:
-                                paypal_url = url_m.group(1)
-                                log_fn(f"  找到 next_action URL")
+                            m = re.search(r'(https://[^"\\]+)', na_str)
+                            if m:
+                                paypal_url = m.group(1)
                                 return
 
-                    # Check if this IS a payment_intent response (direct PI fetch)
                     if data.get("object") == "payment_intent":
                         na = data.get("next_action")
                         if na and isinstance(na, dict):
-                            log_fn(f"  [DEBUG] Direct PI next_action: {json.dumps(na)[:200]}")
-                            redir = na.get("redirect_to_url")
-                            if isinstance(redir, dict):
-                                stripe_url = redir.get("url", "")
-                                if stripe_url:
-                                    paypal_url = stripe_url
-                                    return
                             na_str = json.dumps(na)
-                            url_m = re.search(r'(https://[^"\\]+)', na_str)
-                            if url_m:
-                                paypal_url = url_m.group(1)
+                            m = re.search(r'(https://[^"\\]+)', na_str)
+                            if m:
+                                paypal_url = m.group(1)
                                 return
-
                 except Exception:
                     pass
 
-            # Capture popup windows (Stripe.js opens PayPal in popup)
             async def on_popup(popup):
                 nonlocal paypal_url
                 popup_url = popup.url
-                log_fn(f"  [POPUP] {popup_url[:120]}")
-                if "paypal.com" in popup_url:
-                    ba_m = re.search(r'ba_token=(BA-[A-Za-z0-9]+)', popup_url)
-                    if ba_m:
-                        paypal_url = f"https://www.paypal.com/agreements/approve?ba_token={ba_m.group(1)}"
-                    else:
-                        paypal_url = popup_url
-                elif "pm-redirects.stripe.com" in popup_url:
-                    paypal_url = popup_url
+                if "paypal.com" in popup_url or "pm-redirects" in popup_url:
+                    found = _extract_paypal_url(popup_url)
+                    paypal_url = found or popup_url
 
             page.on("response", on_response)
             page.on("popup", on_popup)
             await page.goto(f"http://127.0.0.1:{port}/checkout.html", timeout=60000)
 
-            # Wait for Stripe.js to init and confirm
             for _ in range(20):
                 await asyncio.sleep(1)
                 ready = await page.evaluate("window.__ready || false")
@@ -380,13 +310,12 @@ window.__lastPollStatus = null;
 
             log_fn("  Stripe.js confirm 已启动")
 
-            # Wait for Stripe to acknowledge the confirm (poll shows status change)
             log_fn("  等待 Stripe 确认...")
             try:
                 await asyncio.wait_for(stripe_confirmed.wait(), timeout=30)
-                log_fn("  Stripe 已确认 confirm")
+                log_fn("  Stripe 已确认")
             except asyncio.TimeoutError:
-                log_fn("  警告: Stripe 确认超时, 尝试继续...")
+                log_fn("  Stripe 确认超时, 继续...")
 
             await asyncio.sleep(2)
 
@@ -418,92 +347,59 @@ window.__lastPollStatus = null;
                 srv.shutdown()
                 return None
 
-            # --- Step 4: Wait for Stripe to return PayPal redirect ---
-            log_fn("Step 4: 等待 Stripe 返回 PayPal redirect...")
+            # --- Step 4: Get PayPal redirect URL ---
+            log_fn("Step 4: 获取 PayPal redirect URL...")
 
-            # Wait up to 30s for response interceptor or popup to find URL
-            for i in range(30):
+            # Brief wait: the response interceptor might catch it from ongoing polls
+            for i in range(5):
                 await asyncio.sleep(1)
                 if paypal_url:
                     break
 
-            # Fallback: check if confirm() resolved with a redirect URL
+            # Primary approach: re-init Stripe checkout to get PI with next_action
             if not paypal_url:
-                log_fn("  尝试从 Stripe.js confirm 结果获取...")
-                confirm_result = await page.evaluate("window.__confirmResult || null")
-                confirm_err = await page.evaluate("window.__confirmError || null")
-                if confirm_result:
-                    log_fn(f"  [DEBUG] confirmResult: {str(confirm_result)[:200]}")
-                    m = re.search(r'(https://[^"\'\\<>\s]*(?:ba_token|pm-redirects|paypal)[^"\'\\<>\s]*)', str(confirm_result))
-                    if m:
-                        paypal_url = m.group(1)
-                if confirm_err:
-                    log_fn(f"  [DEBUG] confirmError: {confirm_err}")
+                log_fn("  重新初始化 Stripe checkout...")
+                reinit_data = await page.evaluate(f"""
+                    (async () => {{
+                        try {{
+                            const stripe = Stripe('{pk}', {{betas: ['custom_checkout_beta_3']}});
+                            const co = await stripe.initCustomCheckout({{clientSecret: '{client_secret}'}});
+                            return 'ok';
+                        }} catch(e) {{ return 'error:' + e.message; }}
+                    }})()
+                """)
+                if reinit_data and reinit_data.startswith("error"):
+                    log_fn(f"  Stripe re-init: {reinit_data}")
 
-            # Fallback: check current page URL (Stripe.js might have redirected)
+                # Wait for interceptor to catch the init response with PI
+                for i in range(10):
+                    await asyncio.sleep(1)
+                    if paypal_url:
+                        break
+
+            # Fallback: check page URL
             if not paypal_url:
                 current_url = page.url
                 if "paypal.com" in current_url or "pm-redirects" in current_url:
-                    log_fn(f"  页面已跳转到: {current_url[:100]}")
                     paypal_url = current_url
-
-            # Fallback: use JavaScript to directly retrieve PI from Stripe
-            if not paypal_url:
-                log_fn("  尝试直接通过 Stripe API 获取 PaymentIntent...")
-                pi_data = await page.evaluate(f"""
-                    (async () => {{
-                        try {{
-                            // Try to get PI via fetch to Stripe API
-                            const resp = await fetch(
-                                'https://api.stripe.com/v1/payment_pages/{cs_id}/confirm',
-                                {{
-                                    method: 'POST',
-                                    headers: {{
-                                        'Content-Type': 'application/x-www-form-urlencoded',
-                                        'Authorization': 'Bearer ' + '{pk}'
-                                    }},
-                                    body: 'client_secret={client_secret}'
-                                }}
-                            );
-                            const text = await resp.text();
-                            return text.substring(0, 2000);
-                        }} catch(e) {{
-                            return 'fetch_error: ' + e.message;
-                        }}
-                    }})()
-                """)
-                if pi_data and "pm-redirects" in str(pi_data):
-                    m = re.search(r'(https://pm-redirects\.stripe\.com[^"\'\\<>\s]+)', str(pi_data))
-                    if m:
-                        paypal_url = m.group(1)
-                        log_fn(f"  从 Stripe API 获取到 redirect URL")
-                elif pi_data and "ba_token" in str(pi_data):
-                    m = re.search(r'ba_token[=:]\s*["\']?(BA-[A-Za-z0-9]+)', str(pi_data))
-                    if m:
-                        paypal_url = f"https://www.paypal.com/agreements/approve?ba_token={m.group(1)}"
-                        log_fn(f"  从 Stripe API 获取到 ba_token")
-                else:
-                    log_fn(f"  [DEBUG] Stripe API resp: {str(pi_data)[:300]}")
 
             await browser.close()
     finally:
         srv.shutdown()
 
     if not paypal_url:
-        log_fn("未能从 Stripe poll 获取 redirect URL")
+        log_fn("未能获取 redirect URL")
         return None
 
     # --- Step 5: Follow Stripe redirect to get PayPal ba_token ---
     log_fn("Step 5: 跟踪 redirect 获取 ba_token...")
 
-    # Check if it's already a PayPal URL
     ba_match = re.search(r'ba_token=(BA-[A-Za-z0-9]+)', paypal_url)
     if ba_match:
         final_url = f"https://www.paypal.com/agreements/approve?ba_token={ba_match.group(1)}"
-        log_fn(f"  直接获取: {final_url}")
+        log_fn(f"  获取成功: {final_url}")
         return final_url
 
-    # Follow Stripe redirect chain
     async with AsyncSession() as sess:
         current_url = paypal_url
         for hop in range(10):
@@ -524,7 +420,6 @@ window.__lastPollStatus = null;
                     current_url = location
                     continue
 
-                # Check body for PayPal URL
                 body = r.text
                 m = re.search(r'https://www\.paypal\.com/[^\s"\'<>]*ba_token=[^\s"\'<>&]+', body)
                 if m:
@@ -626,7 +521,6 @@ async def index():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 3:
-        # CLI mode: python main.py <token> <proxy> [plan]
         _token = sys.argv[1]
         _proxy = parse_proxy(sys.argv[2])
         _plan = sys.argv[3] if len(sys.argv) > 3 else "chatgptplusplan"
@@ -638,6 +532,5 @@ if __name__ == "__main__":
             print("\nFailed to get PayPal URL")
             sys.exit(1)
     else:
-        # Web server mode
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=8080)

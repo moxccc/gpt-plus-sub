@@ -209,8 +209,8 @@
 <!-- Main Form Card -->
 <div class="card">
   <div class="mb16">
-    <label>代理 (格式: user:pass@host:port)</label>
-    <input type="text" id="proxy" placeholder="user:pass@host:port">
+    <label>代理 (格式: user:pass@host:port，自动检测 socks5/http)</label>
+    <input type="text" id="proxy" placeholder="user:pass@host:port 或 socks5://user:pass@host:port">
   </div>
   <div class="btn-group">
     <button class="btn btn-primary" onclick="saveProxy()">保存代理</button>

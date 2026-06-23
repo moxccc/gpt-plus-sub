@@ -46,10 +46,29 @@ class SubmitRequest(BaseModel):
 
 
 def parse_proxy(proxy_str: str) -> str:
+    """Parse proxy string, auto-detect protocol. Supports http/socks5/socks5h."""
     proxy_str = proxy_str.strip()
     if "://" in proxy_str:
         return proxy_str
-    return f"http://{proxy_str}"
+    # Default to socks5 (most residential proxies use socks5)
+    return f"socks5://{proxy_str}"
+
+
+def get_proxy_variants(proxy_str: str) -> list[str]:
+    """Generate proxy URL variants to try different protocols."""
+    proxy_str = proxy_str.strip()
+    if "://" in proxy_str:
+        proto, rest = proxy_str.split("://", 1)
+    else:
+        proto, rest = None, proxy_str
+    variants = []
+    if proto:
+        variants.append(proxy_str)
+    for p in ["socks5", "socks5h", "http"]:
+        url = f"{p}://{rest}"
+        if url not in variants:
+            variants.append(url)
+    return variants
 
 
 def extract_token(token_str: str) -> str:
@@ -112,28 +131,37 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
     log_fn("Step 1: 创建 checkout session...")
     co = None
     working_imp = None
+    working_proxy = None
+    proxy_variants = get_proxy_variants(proxy)
     async with AsyncSession() as sess:
-        for imp in IMPERSONATE_OPTIONS:
-            try:
-                r = await sess.post(
-                    f"{CHATGPT_BASE}/backend-api/payments/checkout",
-                    headers=headers,
-                    json={"plan_type": plan},
-                    proxy=proxy,
-                    impersonate=imp,
-                    timeout=30,
-                )
-                if r.status_code == 200:
-                    co = r.json()
-                    working_imp = imp
-                    log_fn(f"  使用 TLS 指纹: {imp}")
-                    break
-                log_fn(f"  {imp}: HTTP {r.status_code}")
-            except Exception as e:
-                log_fn(f"  {imp}: {str(e)[:60]}")
+        for pvar in proxy_variants:
+            proto = pvar.split("://")[0]
+            for imp in IMPERSONATE_OPTIONS:
+                try:
+                    r = await sess.post(
+                        f"{CHATGPT_BASE}/backend-api/payments/checkout",
+                        headers=headers,
+                        json={"plan_type": plan},
+                        proxy=pvar,
+                        impersonate=imp,
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        co = r.json()
+                        working_imp = imp
+                        working_proxy = pvar
+                        log_fn(f"  连接成功: {proto} + {imp}")
+                        break
+                    log_fn(f"  {proto}+{imp}: HTTP {r.status_code}")
+                except Exception as e:
+                    log_fn(f"  {proto}+{imp}: {str(e)[:60]}")
+                    break  # Same proxy protocol fails, try next protocol
+            if co is not None:
+                break
         if co is None:
-            log_fn("创建 checkout 失败: 所有 TLS 指纹均失败")
+            log_fn("创建 checkout 失败: 所有代理协议+TLS 指纹均失败")
             return None
+    proxy = working_proxy  # Use the working proxy for subsequent requests
 
     cs_id = co.get("checkout_session_id", "")
     pk = co.get("publishable_key", "")

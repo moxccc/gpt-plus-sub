@@ -186,8 +186,11 @@ async def get_paypal_link(token: str, proxy: str, plan: str = "chatgptplusplan",
 <script src="https://js.stripe.com/v3/"></script>
 <script>
 window.__ready = false;
+window.__confirmed = false;
 window.__error = null;
 window.__paypalUrl = null;
+window.__pollCount = 0;
+window.__lastPollStatus = null;
 
 (async function() {{
     try {{
@@ -220,8 +223,13 @@ window.__paypalUrl = null;
         co.confirm({{
             paymentMethod: paymentMethod.id,
             returnUrl: 'https://chatgpt.com/#settings/subscription'
-        }}).then(r => {{ window.__confirmResult = r; }})
-          .catch(e => {{ window.__confirmError = e.message; }});
+        }}).then(r => {{
+            window.__confirmed = true;
+            window.__confirmResult = JSON.stringify(r);
+        }}).catch(e => {{
+            window.__confirmed = true;
+            window.__confirmError = e.message;
+        }});
     }} catch(e) {{
         window.__error = 'Init: ' + e.message;
     }}
@@ -238,7 +246,9 @@ window.__paypalUrl = null;
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
             page = await browser.new_page()
 
-            # Intercept Stripe poll responses to find payment_intent.next_action
+            stripe_confirmed = asyncio.Event()
+
+            # Intercept Stripe poll responses to detect state changes and find redirect
             async def on_response(resp):
                 nonlocal paypal_url
                 if paypal_url:
@@ -251,6 +261,16 @@ window.__paypalUrl = null;
                     if not body_text.startswith('{'):
                         return
                     data = json.loads(body_text)
+
+                    # Track poll status
+                    po_status = data.get("payment_object_status")
+                    if po_status:
+                        await page.evaluate(f"window.__lastPollStatus = '{po_status}'")
+                        await page.evaluate("window.__pollCount++")
+                        log_fn(f"  Stripe poll: payment_object_status={po_status}")
+                        if po_status in ("requires_action", "requires_confirmation", "processing"):
+                            stripe_confirmed.set()
+
                     pi = data.get("payment_intent")
                     if pi and isinstance(pi, dict):
                         na = pi.get("next_action")
@@ -281,23 +301,40 @@ window.__paypalUrl = null;
                     break
 
             log_fn("  Stripe.js confirm 已启动")
-            await asyncio.sleep(3)
+
+            # Wait for Stripe to acknowledge the confirm (poll shows status change)
+            log_fn("  等待 Stripe 确认...")
+            try:
+                await asyncio.wait_for(stripe_confirmed.wait(), timeout=30)
+                log_fn("  Stripe 已确认 confirm")
+            except asyncio.TimeoutError:
+                log_fn("  警告: Stripe 确认超时, 尝试继续...")
+
+            await asyncio.sleep(2)
 
             # --- Step 3: Approve ---
             log_fn("Step 3: 调用 approve 端点...")
-            async with AsyncSession() as sess:
-                r = await sess.post(
-                    f"{CHATGPT_BASE}/backend-api/payments/checkout/approve",
-                    headers=headers,
-                    json={"checkout_session_id": cs_id, "processor_entity": proc_entity},
-                    proxy=proxy,
-                    impersonate=working_imp or IMPERSONATE_OPTIONS[0],
-                    timeout=30,
-                )
-                approve_result = r.json()
-                log_fn(f"  Approve: {approve_result}")
+            approve_result = None
+            for approve_attempt in range(3):
+                async with AsyncSession() as sess:
+                    r = await sess.post(
+                        f"{CHATGPT_BASE}/backend-api/payments/checkout/approve",
+                        headers=headers,
+                        json={"checkout_session_id": cs_id, "processor_entity": proc_entity},
+                        proxy=proxy,
+                        impersonate=working_imp or IMPERSONATE_OPTIONS[0],
+                        timeout=30,
+                    )
+                    approve_result = r.json()
+                    log_fn(f"  Approve [{approve_attempt+1}]: {approve_result}")
 
-            if approve_result.get("result") != "approved":
+                if approve_result.get("result") == "approved":
+                    break
+                if approve_attempt < 2:
+                    log_fn(f"  Approve 未成功, {3+approve_attempt*2}秒后重试...")
+                    await asyncio.sleep(3 + approve_attempt * 2)
+
+            if not approve_result or approve_result.get("result") != "approved":
                 log_fn("  Approve 失败")
                 await browser.close()
                 srv.shutdown()
